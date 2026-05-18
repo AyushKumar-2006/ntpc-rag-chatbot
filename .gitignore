@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+node_modules/
+.next/
+chroma_db/
+*.db
+*.sqlite3
+*.dylib
+backend/reports/
+backend/venv/
+backend/chroma/
+data/
