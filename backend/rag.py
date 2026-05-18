@@ -1,5 +1,6 @@
 # backend/rag.py
 import os
+import asyncio
 import chromadb
 import ollama
 from embedder import embed_text
@@ -7,10 +8,12 @@ from embedder import embed_text
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHROMA_PATH = "/Users/ayushkumar/ntpc-rag-chatbot/backend/chroma"
+CHROMA_PATH     = "/Users/ayushkumar/ntpc-rag-chatbot/backend/chroma"
 COLLECTION_NAME = "ntpc_content"
-MODEL = "llama3.2"
-TOP_K = 30
+MODEL           = "llama3.2"
+TOP_K           = 15
+DISTANCE_CUTOFF = 1.2
+MAX_CONTEXT_CHARS = 12000
 
 YEAR_TO_FILE = {
     "2017-18": "2017-18.pdf",
@@ -22,75 +25,58 @@ YEAR_TO_FILE = {
     "2023-24": "Annual Report 2023-24.pdf",
     "2024-25": "Annual Report 2024-25_1.pdf",
 }
-
 LATEST_YEAR = "2024-25"
 
-# Query expansion — fuzzy topics ko better search karo
-QUERY_EXPANSIONS = {
-    # Strategy
-    "brighter plan":        "Brighter Plan 2032 renewable energy strategy decarbonization net zero",
-    "vision":               "NTPC vision mission strategy long term plan",
-    "strategy":             "NTPC strategy plan target goals objectives",
-
-    # Energy
-    "green hydrogen":       "green hydrogen projects pilot NTPC electrolyzer",
-    "renewable target":     "renewable energy capacity target solar wind 2032 GW",
-    "solar":                "solar power capacity MW GW projects commissioned",
-    "wind":                 "wind energy capacity projects commissioned MW",
-    "hydro":                "hydro power hydroelectric capacity stations",
-    "nuclear":              "nuclear energy power NTPC atomic",
-    "coal":                 "coal based thermal power stations capacity generation",
-
-    # Financial
-    "dividend history":     "dividend per share interim final equity shareholder payout",
-    "total income":         "total income revenue from operations turnover crore",
-    "profit":               "profit after tax PAT net profit crore",
-    "revenue":              "revenue total income operations crore financial",
-    "debt":                 "debt borrowings long term short term crore ratio",
-    "credit rating":        "credit rating CRISIL ICRA AAA debt rating",
-    "capex":                "capital expenditure capex investment crore",
-    "pat":                  "profit after tax PAT net profit crore earnings",
-    "ebitda":               "EBITDA operating profit earnings before interest tax",
-
-    # Operational
-    "plf":                  "Plant Load Factor PLF coal stations national average generation",
-    "capacity":             "installed capacity commercial MW GW stations total",
-    "generation":           "gross generation units BU billion units sent out",
-    "employees":            "number of employees workforce manpower human resource",
-    "stations":             "power stations plants NTPC locations units",
-
-    # Sustainability
-    "csr":                  "CSR corporate social responsibility community development education health",
-    "esg":                  "ESG environment social governance sustainability reporting",
-    "carbon":               "carbon emission CO2 greenhouse gas climate change",
-    "water":                "water consumption stewardship management conservation",
-    "environment":          "environment sustainability green emission pollution",
-
-    # Corporate
-    "subsidiaries":         "subsidiaries joint ventures NTPC group companies list",
-    "board":                "board of directors chairman CMD management",
-    "awards":               "awards recognition achievements honours certifications",
-    "csr":                  "CSR corporate social responsibility community",
-    "related party":        "related party transactions subsidiaries associates",
-
-   #  some more 
-   "auditor":    "statutory auditor CA chartered accountant audit firm",
-   "pankaj":     "auditor statutory CA chartered accountant firm",
-   "director":   "board of directors independent executive non-executive",
-   "chairman":   "chairman CMD MD CEO management board",
-   "director":   "Shri Mahabir Prasad has done M.Sc. (Statistics) from University of Delhi and is a law graduate."
+QUERY_EXPANSIONS: dict[str, str] = {
+    "brighter plan":    "Brighter Plan 2032 renewable energy strategy decarbonization net zero",
+    "vision":           "NTPC vision mission strategy long term plan",
+    "strategy":         "NTPC strategy plan target goals objectives",
+    "green hydrogen":   "green hydrogen projects pilot NTPC electrolyzer",
+    "renewable":        "renewable energy capacity target solar wind 2032 GW",
+    "solar":            "solar power capacity MW GW projects commissioned",
+    "wind":             "wind energy capacity projects commissioned MW",
+    "hydro":            "hydro power hydroelectric capacity stations",
+    "nuclear":          "nuclear energy power NTPC atomic",
+    "coal":             "coal based thermal power stations capacity generation",
+    "dividend":         "dividend per share interim final equity shareholder payout",
+    "total income":     "total income revenue from operations turnover crore",
+    "profit":           "profit after tax PAT net profit crore",
+    "revenue":          "revenue total income operations crore financial",
+    "debt":             "debt borrowings long term short term crore ratio",
+    "credit rating":    "credit rating CRISIL ICRA AAA debt rating",
+    "capex":            "capital expenditure capex investment crore",
+    "pat":              "profit after tax PAT net profit crore earnings",
+    "ebitda":           "EBITDA operating profit earnings before interest tax depreciation",
+    "plf":              "Plant Load Factor PLF coal stations national average generation",
+    "capacity":         "installed capacity commercial MW GW stations total",
+    "generation":       "gross generation units BU billion units sent out",
+    "employees":        "number of employees workforce manpower human resource",
+    "stations":         "power stations plants NTPC locations units",
+    "csr":              "CSR corporate social responsibility community development education health",
+    "esg":              "ESG environment social governance sustainability reporting",
+    "carbon":           "carbon emission CO2 greenhouse gas climate change",
+    "water":            "water consumption stewardship management conservation",
+    "environment":      "environment sustainability green emission pollution",
+    "subsidiaries":     "subsidiaries joint ventures NTPC group companies list",
+    "board":            "board of directors chairman CMD management executive",
+    "awards":           "awards recognition achievements honours certifications",
+    "related party":    "related party transactions subsidiaries associates",
+    "auditor":          "statutory auditor CA chartered accountant audit firm",
+    "director":         "board of directors independent executive non-executive members",
+    "chairman":         "chairman CMD MD CEO management board NTPC",
+    "shareholder":      "shareholders equity shares AGM annual general meeting",
 }
 
 SYSTEM_PROMPT = """You are a strict document retrieval assistant for NTPC Limited.
 
-ABSOLUTE RULES — NO EXCEPTIONS:
+ABSOLUTE RULES:
 1. Use ONLY the context provided — ZERO outside knowledge
-2. If not in context → respond EXACTLY: "This information is not available in the provided NTPC reports."
-3. NEVER say 'However', 'I can tell you', 'based on general knowledge', 'I am unable to verify but' — FORBIDDEN
-4. NEVER suggest or guess — only state what is written in context
-5. Always mention exact report name and page number
-6. Numbers in context → state directly, never say 'not explicitly stated'
-7. Detailed answers — minimum 3-4 sentences with all numbers"""
+2. If not in context → say EXACTLY: "This information is not available in the provided NTPC reports."
+3. NEVER say 'However', 'based on general knowledge', 'I am unable to verify' — FORBIDDEN
+4. NEVER guess — only state what is written in context
+5. Always cite exact report name and page number
+6. State numbers directly — never say 'not explicitly stated'
+7. Minimum 3-4 sentences with all numbers"""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CHROMADB INIT
@@ -98,7 +84,7 @@ ABSOLUTE RULES — NO EXCEPTIONS:
 def init_collection():
     try:
         client = chromadb.PersistentClient(path=CHROMA_PATH)
-        col = client.get_collection(name=COLLECTION_NAME)
+        col    = client.get_collection(name=COLLECTION_NAME)
         print(f"✅ ChromaDB loaded. Documents: {col.count()}")
         return col
     except Exception as e:
@@ -110,73 +96,134 @@ collection = init_collection()
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def detect_years(question: str):
+def detect_years(question: str) -> list[str]:
     return [y for y in YEAR_TO_FILE if y in question]
 
 def is_current_question(question: str) -> bool:
-    keywords = ["current", "latest", "now", "today", "recent", "abhi", "present"]
-    return any(kw in question.lower() for kw in keywords)
+    return any(kw in question.lower() for kw in
+               ["current", "latest", "now", "today", "recent", "abhi", "present"])
 
-def expand_query(question: str, base_q: str) -> str:
-    q_lower = question.lower()
-    for key, expansion in QUERY_EXPANSIONS.items():
-        if key in q_lower:
-            return f"{base_q} {expansion}"
-    return base_q
+def expand_query(question: str) -> str:
+    q_lower    = question.lower()
+    expansions = [exp for key, exp in QUERY_EXPANSIONS.items() if key in q_lower]
+    if expansions:
+        return f"{question} {' '.join(expansions)}"
+    return question
 
-def query_chroma(embedding, year_filter=None, top_k=TOP_K):
-    try:
-        kwargs = {
-            "query_embeddings": [embedding],
-            "n_results": min(top_k, collection.count()),
-            "include": ["documents", "metadatas", "distances"]
-        }
-        if year_filter:
-            kwargs["where"] = {"source": YEAR_TO_FILE[year_filter]}
-        return collection.query(**kwargs)
-    except Exception:
-        return collection.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, collection.count()),
-            include=["documents", "metadatas", "distances"]
-        )
+def generate_sub_queries(question: str) -> list[str]:
+    q     = question.strip()
+    q_exp = expand_query(q)
+    stopwords = {"what","is","are","the","of","in","for","a","an","and","or",
+                 "was","were","has","have","how","many","much","ntpc","about",
+                 "tell","me","give","from","to","its","their","which","who"}
+    keywords = " ".join(
+        w for w in q.lower().split()
+        if w not in stopwords and len(w) > 3
+    )
+    return list(dict.fromkeys([q, q_exp, keywords]))
 
-def fetch_multi_year(embedding, years):
-    all_chunks, all_metas, all_dists = [], [], []
-    for yr in years:
+def query_chroma_single(embedding, year_filter=None, top_k=TOP_K):
+    kwargs = {
+        "query_embeddings": [embedding],
+        "n_results":        min(top_k, collection.count()),
+        "include":          ["documents", "metadatas", "distances"],
+    }
+    if year_filter and year_filter in YEAR_TO_FILE:
+        kwargs["where"] = {"source": YEAR_TO_FILE[year_filter]}
+    return collection.query(**kwargs)
+
+def multi_query_chroma(question: str, year_filter=None) -> tuple[list, list, list]:
+    sub_queries = generate_sub_queries(question)
+    seen_chunks: dict[str, tuple[str, dict, float]] = {}
+
+    for sq in sub_queries:
         try:
-            res = query_chroma(embedding, year_filter=yr, top_k=10)
-            all_chunks += res["documents"][0]
-            all_metas  += res["metadatas"][0]
-            all_dists  += res["distances"][0]
+            emb   = embed_text(sq)
+            res   = query_chroma_single(emb, year_filter=year_filter)
+            docs  = res["documents"][0]
+            metas = res["metadatas"][0]
+            dists = res["distances"][0]
+            for chunk, meta, dist in zip(docs, metas, dists):
+                key = chunk[:120]
+                if key not in seen_chunks or dist < seen_chunks[key][2]:
+                    seen_chunks[key] = (chunk, meta, dist)
         except Exception:
             pass
-    return all_chunks, all_metas, all_dists
 
-def build_context(chunks, metadatas):
-    parts = []
+    ranked = sorted(seen_chunks.values(), key=lambda x: x[2])
+    ranked = [r for r in ranked if r[2] < DISTANCE_CUTOFF]
+
+    if not ranked:
+        ranked = sorted(seen_chunks.values(), key=lambda x: x[2])[:TOP_K]
+
+    return (
+        [r[0] for r in ranked],
+        [r[1] for r in ranked],
+        [r[2] for r in ranked],
+    )
+
+async def fetch_multi_year_parallel(question: str, years: list[str]):
+    loop = asyncio.get_event_loop()
+
+    async def fetch_one(yr):
+        return await loop.run_in_executor(
+            None,
+            lambda: multi_query_chroma(question, year_filter=yr)
+        )
+
+    results = await asyncio.gather(*[fetch_one(yr) for yr in years])
+
+    all_chunks, all_metas, all_dists = [], [], []
+    for chunks, metas, dists in results:
+        all_chunks += chunks
+        all_metas  += metas
+        all_dists  += dists
+
+    combined = sorted(zip(all_chunks, all_metas, all_dists), key=lambda x: x[2])
+    seen, final = set(), []
+    for chunk, meta, dist in combined:
+        key = chunk[:120]
+        if key not in seen:
+            seen.add(key)
+            final.append((chunk, meta, dist))
+
+    return (
+        [x[0] for x in final],
+        [x[1] for x in final],
+        [x[2] for x in final],
+    )
+
+def build_context(chunks: list[str], metadatas: list[dict]) -> str:
+    parts, total = [], 0
     for i, (chunk, meta) in enumerate(zip(chunks, metadatas)):
         source = meta.get("source", meta.get("title", "Unknown"))
         page   = meta.get("page", "")
         label  = f"{source} | Page {page}" if page else source
-        parts.append(f"[Source {i+1}: {label}]\n{chunk}")
+        entry  = f"[Source {i+1}: {label}]\n{chunk}"
+        if total + len(entry) > MAX_CONTEXT_CHARS:
+            break
+        parts.append(entry)
+        total += len(entry)
     return "\n\n---\n\n".join(parts)
 
-def build_sources(metadatas, distances):
-    sources = []
-    seen = set()
+def build_sources(metadatas: list[dict], distances: list[float]) -> list[dict]:
+    sources, seen = [], set()
     for meta, dist in sorted(zip(metadatas, distances), key=lambda x: x[1]):
+        if dist >= DISTANCE_CUTOFF:
+            continue
         source = meta.get("source", "Unknown")
-        if source not in seen and dist < 1.5:
+        if source not in seen:
             seen.add(source)
             sources.append({
-                "title": source.replace(".pdf", "").replace("-", " ").replace("_", " "),
-                "url": "",
-                "section": f"Page {meta.get('page', 'N/A')}"
+                "title":   source.replace(".pdf","").replace("-"," ").replace("_"," "),
+                "url":     "",
+                "section": f"Page {meta.get('page','N/A')}"
             })
-    return sources[:4]
+        if len(sources) == 4:
+            break
+    return sources
 
-def parse_llm_response(raw: str):
+def parse_llm_response(raw: str) -> tuple[str, list[str]]:
     followups, answer_lines = [], []
     for line in raw.split("\n"):
         if line.strip().startswith("FOLLOWUP:"):
@@ -188,7 +235,7 @@ def parse_llm_response(raw: str):
 DEFAULT_FOLLOWUPS = [
     "What is NTPC's renewable energy capacity?",
     "What are NTPC's financial highlights for the latest year?",
-    "How has NTPC's installed capacity grown over the years?"
+    "How has NTPC's installed capacity grown over the years?",
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -198,98 +245,79 @@ async def get_rag_answer(question: str) -> dict:
 
     if collection is None or collection.count() == 0:
         return {
-            "answer": "Knowledge base not ready. Please run indexer.py first.",
-            "sources": [],
-            "follow_up_questions": DEFAULT_FOLLOWUPS
+            "answer":              "Knowledge base not ready. Please run indexer.py first.",
+            "sources":             [],
+            "follow_up_questions": DEFAULT_FOLLOWUPS,
         }
 
-    # Step 1: Detect years + intent
     found_years   = detect_years(question)
     is_comparison = len(found_years) > 1
     is_current    = not found_years and is_current_question(question)
+    year_hint     = LATEST_YEAR if is_current else (found_years[0] if len(found_years) == 1 else None)
 
-    if is_current:
-        year_hint  = LATEST_YEAR
-        enhanced_q = f"{question} (latest year: {LATEST_YEAR})"
-    elif len(found_years) == 1:
-        year_hint  = found_years[0]
-        enhanced_q = f"{question} (year: {found_years[0]})"
-    else:
-        year_hint  = None
-        enhanced_q = question
-
-    # Step 1b: Query expansion for fuzzy topics
-    enhanced_q = expand_query(question, enhanced_q)
-
-    # Step 2: Embed
-    embedding = embed_text(enhanced_q)
-
-    # Step 3: Fetch
     if is_comparison:
-        chunks, metadatas, distances = fetch_multi_year(embedding, found_years)
+        chunks, metadatas, distances = await fetch_multi_year_parallel(question, found_years)
     else:
-        results   = query_chroma(embedding, year_filter=year_hint)
-        chunks    = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
+        chunks, metadatas, distances = multi_query_chroma(question, year_filter=year_hint)
 
     if not chunks:
         return {
-            "answer": "This information is not available in the provided NTPC reports.",
-            "sources": [],
-            "follow_up_questions": DEFAULT_FOLLOWUPS
+            "answer":              "This information is not available in the provided NTPC reports.",
+            "sources":             [],
+            "follow_up_questions": DEFAULT_FOLLOWUPS,
         }
 
-    # Step 4: Build context + prompt
     context = build_context(chunks, metadatas)
 
     if is_comparison:
-        year_instruction = f"(Compare data across years: {', '.join(found_years)} — show EACH year separately)"
+        year_instruction = f"Compare data across years: {', '.join(found_years)} — show EACH year separately with numbers."
     elif year_hint:
-        year_instruction = f"(Use data from year: {year_hint} only)"
+        year_instruction = f"Use data from year: {year_hint} only."
     else:
-        year_instruction = "(Use the most recent year available in context)"
+        year_instruction = "Use the most recent year available in context."
 
     user_message = f"""Context from NTPC Annual Reports:
 
 {context}
 
 Question: {question}
-{year_instruction}
+Instruction: {year_instruction}
 
-IMPORTANT:
-- Give a DETAILED and COMPLETE answer with exact numbers
-- For comparison: show ALL years side by side with numbers
-- For strategy/plan questions: include all targets, timelines, and key details
+Rules:
+- Detailed and complete answer with exact numbers
+- For comparisons: show ALL years side by side
 - ONLY use information from the context above
-- Always mention exact report name and page number
+- Always cite exact report name and page number
 - Minimum 3-4 sentences
 
-End with exactly 3 follow-up questions on separate lines prefixed with 'FOLLOWUP:'"""
+End your response with exactly 3 follow-up questions, each on a new line prefixed with 'FOLLOWUP:'"""
 
-    # Step 5: LLM call
     try:
         response = ollama.chat(
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_message}
-            ]
+                {"role": "user",   "content": user_message},
+            ],
+            options={
+                "temperature": 0.1,
+                "num_predict": 600,
+                "num_ctx":     4096,
+            }
         )
         raw = response["message"]["content"]
     except Exception as e:
         return {
-            "answer": f"LLM error: {str(e)}. Please check if Ollama is running.",
-            "sources": [],
-            "follow_up_questions": DEFAULT_FOLLOWUPS
+            "answer":              f"LLM error: {str(e)}. Check if Ollama is running.",
+            "sources":             [],
+            "follow_up_questions": DEFAULT_FOLLOWUPS,
         }
 
-    # Step 6: Parse + return
     answer, followups = parse_llm_response(raw)
-    sources = build_sources(metadatas, distances)
+    sources           = build_sources(metadatas, distances)
 
     return {
-        "answer": answer,
-        "sources": sources,
-        "follow_up_questions": followups[:3] if followups else DEFAULT_FOLLOWUPS
+        "answer":              answer,
+        "sources":             sources,
+        "follow_up_questions": followups[:3] if followups else DEFAULT_FOLLOWUPS,
     }
