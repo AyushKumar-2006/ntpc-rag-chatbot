@@ -45,7 +45,7 @@ User Question
 ┌─────────────────┐
 │   Next.js UI    │  ◄── Beautiful chat interface
 └────────┬────────┘
-│ API Call
+│ 
 ▼
 ┌─────────────────┐
 │  FastAPI Server │  ◄── Python backend
